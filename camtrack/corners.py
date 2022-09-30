@@ -53,46 +53,59 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     QUALITY_LEVEL = 0.08
     MIN_DISTANCE = 4
 
-
-    new_poses = cv2.goodFeaturesToTrack(image=prev_image,
-                                        maxCorners=MAX_CORNERS,
-                                        qualityLevel=QUALITY_LEVEL,
-                                        minDistance=MIN_DISTANCE,
-                                        mask=None)
-    max_ind = new_poses.shape[0] + 1
+    new_points = cv2.goodFeaturesToTrack(image=prev_image,
+                                         maxCorners=MAX_CORNERS,
+                                         qualityLevel=QUALITY_LEVEL,
+                                         minDistance=MIN_DISTANCE,
+                                         mask=None)
+    max_ind = new_points.shape[0]
     LEN_OF_CORNER = 10
     frame_corners = FrameCorners(
-        ids=np.arange(len(new_poses)),
-        points=new_poses,
-        sizes=np.full(len(new_poses), LEN_OF_CORNER)
+        ids=np.arange(len(new_points)),
+        points=new_points,
+        sizes=np.full(len(new_points), LEN_OF_CORNER)
     )
 
     builder.set_corners_at_frame(0, frame_corners)
     lk_params = dict()
     for i_frame, image in enumerate(frame_sequence[1:], 1):
-        new_poses, statuses, error = cv2.calcOpticalFlowPyrLK(prevImg=np.uint8(prev_image * 255),
-                                                              nextImg=np.uint8(image * 255),
-                                                              prevPts=frame_corners.points,
-                                                              nextPts=None,
-                                                              **lk_params)
+        new_points, statuses, error = cv2.calcOpticalFlowPyrLK(prevImg=np.uint8(prev_image * 255),
+                                                               nextImg=np.uint8(image * 255),
+                                                               prevPts=frame_corners.points,
+                                                               nextPts=None)
+
+        #print(new_points)
 
         statuses = statuses.ravel()
         ids = frame_corners.ids.ravel()
+        #print("Status=", statuses.shape)
+        #print("IDS=", ids.shape)
+        #print("NEW_POINTS=", new_points.shape)
+        prev_image = image
 
-        new_poses = new_poses[statuses == 1]
+        new_points = new_points[statuses == 1]
+        #print(statuses)
+
         ids = ids[statuses == 1]
+        count_extra_points = MAX_CORNERS - new_points.shape[0]
+        #print("COUNR_EXTRA_POINTS=", count_extra_points)
 
-        count_extra_points = MAX_CORNERS - new_poses.shape[0]
+        if count_extra_points == 0:
+            frame_corners._points = new_points
+            builder.set_corners_at_frame(i_frame, frame_corners)
+            prev_image = image
+            continue
+
         # 1 := empty
         mask = np.ones(shape=image.shape, dtype=np.uint8)
-        for x, y in new_poses:
+        for x, y in new_points:
             cv2.circle(img=mask,
                        center=(np.uint8(x), np.uint8(y)),
                        radius=MIN_DISTANCE,
                        color=0,
                        thickness=-1)
 
-        #print(mask)
+        # print(mask)
 
         extra_points = cv2.goodFeaturesToTrack(image=image,
                                                maxCorners=count_extra_points,
@@ -103,8 +116,29 @@ def _build_impl(frame_sequence: pims.FramesSequence,
         # append extra_points to new_points
         extra_points = extra_points.reshape(extra_points.shape[0], 2)
 
+        # print("DEBAG ", ids.shape, (np.array([np.arange(max_ind, max_ind + count_extra_points)]).T).shape)
 
+        ids = np.hstack((ids, np.arange(max_ind, max_ind + count_extra_points)))
+        #print("IDS=", ids.shape)
 
+        #print("D1")
+        new_points = np.vstack((new_points, extra_points))
+        #print(new_points.shape)
+        #print("D2")
+        #print(frame_corners.sizes.shape)
+
+        sizes = np.hstack((frame_corners.sizes.reshape(-1), np.full(count_extra_points, LEN_OF_CORNER)))
+        #print("D3")
+        #print(sizes.shape)
+
+        max_ind += count_extra_points
+
+        frame_corners._ids = ids.reshape(-1, 1)
+        frame_corners._points = new_points
+        frame_corners._sizes = sizes.reshape(-1, 1)
+
+        builder.set_corners_at_frame(i_frame, frame_corners)
+        prev_image = image
 
 
 def build(frame_sequence: pims.FramesSequence,
