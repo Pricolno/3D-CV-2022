@@ -48,17 +48,63 @@ class _CornerStorageBuilder:
 
 def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
-    # TODO
-    image_0 = frame_sequence[0]
-    corners = FrameCorners(
-        np.array([0]),
-        np.array([[0, 0]]),
-        np.array([55])
+    prev_image = frame_sequence[0]
+    MAX_CORNERS = 700
+    QUALITY_LEVEL = 0.08
+    MIN_DISTANCE = 4
+
+
+    new_poses = cv2.goodFeaturesToTrack(image=prev_image,
+                                        maxCorners=MAX_CORNERS,
+                                        qualityLevel=QUALITY_LEVEL,
+                                        minDistance=MIN_DISTANCE,
+                                        mask=None)
+    max_ind = new_poses.shape[0] + 1
+    LEN_OF_CORNER = 10
+    frame_corners = FrameCorners(
+        ids=np.arange(len(new_poses)),
+        points=new_poses,
+        sizes=np.full(len(new_poses), LEN_OF_CORNER)
     )
-    builder.set_corners_at_frame(0, corners)
-    for frame, image_1 in enumerate(frame_sequence[1:], 1):
-        builder.set_corners_at_frame(frame, corners)
-        image_0 = image_1
+
+    builder.set_corners_at_frame(0, frame_corners)
+    lk_params = dict()
+    for i_frame, image in enumerate(frame_sequence[1:], 1):
+        new_poses, statuses, error = cv2.calcOpticalFlowPyrLK(prevImg=np.uint8(prev_image * 255),
+                                                              nextImg=np.uint8(image * 255),
+                                                              prevPts=frame_corners.points,
+                                                              nextPts=None,
+                                                              **lk_params)
+
+        statuses = statuses.ravel()
+        ids = frame_corners.ids.ravel()
+
+        new_poses = new_poses[statuses == 1]
+        ids = ids[statuses == 1]
+
+        count_extra_points = MAX_CORNERS - new_poses.shape[0]
+        # 1 := empty
+        mask = np.ones(shape=image.shape, dtype=np.uint8)
+        for x, y in new_poses:
+            cv2.circle(img=mask,
+                       center=(np.uint8(x), np.uint8(y)),
+                       radius=MIN_DISTANCE,
+                       color=0,
+                       thickness=-1)
+
+        #print(mask)
+
+        extra_points = cv2.goodFeaturesToTrack(image=image,
+                                               maxCorners=count_extra_points,
+                                               qualityLevel=QUALITY_LEVEL,
+                                               minDistance=MIN_DISTANCE,
+                                               mask=mask)
+
+        # append extra_points to new_points
+        extra_points = extra_points.reshape(extra_points.shape[0], 2)
+
+
+
 
 
 def build(frame_sequence: pims.FramesSequence,
