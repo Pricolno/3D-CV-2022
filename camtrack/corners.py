@@ -102,9 +102,10 @@ def track_corners(image_0, image_1, corners):
 
 def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
+    # params for ShiTomasi corner detection
     feature_params = dict(maxCorners=1000,
-                          qualityLevel=0.5,
-                          minDistance=10,
+                          qualityLevel=0.06,
+                          minDistance=16,
                           blockSize=10)
 
 
