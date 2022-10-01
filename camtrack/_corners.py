@@ -23,25 +23,20 @@ import numpy as np
 
 import frameseq
 
-
 class FrameCorners:
     """
     namedtuple-like class representing corners belonging to one frame.
-
     All fields should be NumPy 2D arrays of shape=(-1, 2) or shape=(-1, 1).
-
     All data should be sorted by corner ids to allow usage of binary search
     (np.searchsorted).
     """
 
-    __slots__ = ('_ids', '_points', '_sizes')
+    __slots__ = ('_ids', '_points', '_sizes', '_min_eigenvals', '_dist_err')
 
     def __init__(self, ids, points, sizes):
         """
         Construct FrameCorners.
-
         You may add your own fields if needed.
-
         :param ids: integer ids of corners
         :param points: coordinates of corners
         :param sizes: block sizes used for corner calculation (in pixels on original image format)
@@ -50,6 +45,14 @@ class FrameCorners:
         self._ids = ids[sorting_idx].reshape(-1, 1)
         self._points = points[sorting_idx].reshape(-1, 2)
         self._sizes = sizes[sorting_idx].reshape(-1, 1)
+
+    @staticmethod
+    def empty_frame():
+        return FrameCorners(
+            np.array([]).reshape((-1, 1)).astype(int),
+            np.array([]).reshape((-1, 2)).astype(np.float32),
+            np.array([]).reshape((-1, 1)).astype(int),
+        )
 
     @property
     def ids(self):
@@ -67,6 +70,20 @@ class FrameCorners:
         yield self.ids
         yield self.points
         yield self.sizes
+
+    def add_points(self, ids, points, sizes):
+        if ids is None:
+            if self._ids.shape[0] == 0:
+                next_id = 0
+            else:
+                next_id = max(self._ids) + 1
+            ids = np.arange(next_id, next_id + points.shape[0]).reshape((-1, 1))
+
+        self._ids = np.concatenate((self._ids, ids.reshape((-1, 1))))
+        self._points = np.concatenate((self._points, points.reshape((-1, 2))))
+        self._sizes = np.concatenate((self._sizes, sizes.reshape((-1, 1))))
+
+
 
 
 def filter_frame_corners(frame_corners: FrameCorners,
