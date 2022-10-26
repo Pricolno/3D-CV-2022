@@ -57,7 +57,7 @@ def create_mask_by_corners(image, corners):
     return mask
 
 
-def add_corners(image, feature_params, corners=None, max_pyramid_lvl=4):
+def add_corners(image, feature_params, max_corner_id, corners=None, max_pyramid_lvl=4):
     if corners is not None:
         mask = create_mask_by_corners(image, corners)
     else:
@@ -72,9 +72,13 @@ def add_corners(image, feature_params, corners=None, max_pyramid_lvl=4):
         n = new_p.shape[0]
         new_sizes = np.full(n, feature_params['blockSize']).reshape((-1, 1))
 
-        corners.add_points(None, new_p, new_sizes)
+        #corners.add_points(None, new_p, new_sizes)
 
-    return corners
+        new_ids = np.arange(max_corner_id, max_corner_id + n)
+        max_corner_id += n
+        corners.add_points(new_ids, new_p, new_sizes)
+
+    return corners, max_corner_id
 
 
 def track_corners(image_0, image_1, corners):
@@ -104,20 +108,24 @@ def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
     # params for ShiTomasi corner detection
     feature_params = dict(maxCorners=1000,
-                          qualityLevel=0.06,
-                          minDistance=16,
+                          qualityLevel=0.01,
+                          minDistance=10,
                           blockSize=10)
 
 
     image_0 = (frame_sequence[0] * 255.0).astype(np.uint8)
-    corners = add_corners(image_0, feature_params)
+    #corners = add_corners(image_0, feature_params)
+    max_corner_id = 0
+    corners, max_corner_id = add_corners(image_0, feature_params, max_corner_id)
+
     builder.set_corners_at_frame(0, corners)
 
     for frame, image_1 in enumerate(frame_sequence[1:], 1):
         image_1 = (image_1 * 255.0).astype(np.uint8)
         corners = track_corners(image_0, image_1, corners)
 
-        corners = add_corners(image_1, feature_params, corners)
+        #corners = add_corners(image_1, feature_params, corners)
+        corners, max_corner_id = add_corners(image_1, feature_params, max_corner_id, corners)
 
         builder.set_corners_at_frame(frame, corners)
         image_0 = image_1

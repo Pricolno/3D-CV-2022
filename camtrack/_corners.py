@@ -72,13 +72,6 @@ class FrameCorners:
         yield self.sizes
 
     def add_points(self, ids, points, sizes):
-        if ids is None:
-            if self._ids.shape[0] == 0:
-                next_id = 0
-            else:
-                next_id = max(self._ids) + 1
-            ids = np.arange(next_id, next_id + points.shape[0]).reshape((-1, 1))
-
         self._ids = np.concatenate((self._ids, ids.reshape((-1, 1))))
         self._points = np.concatenate((self._points, points.reshape((-1, 2))))
         self._sizes = np.concatenate((self._sizes, sizes.reshape((-1, 1))))
