@@ -34,9 +34,9 @@ class FrameCorners:
     (np.searchsorted).
     """
 
-    __slots__ = ('_ids', '_points', '_sizes')
+    __slots__ = ('_ids', '_points', '_sizes', '_min_eigenvals', '_dist_err')
 
-    def __init__(self, ids, points, sizes):
+    def __init__(self, ids, points, sizes, min_eigenvals, dist_err):
         """
         Construct FrameCorners.
 
@@ -50,6 +50,18 @@ class FrameCorners:
         self._ids = ids[sorting_idx].reshape(-1, 1)
         self._points = points[sorting_idx].reshape(-1, 2)
         self._sizes = sizes[sorting_idx].reshape(-1, 1)
+        self._min_eigenvals = min_eigenvals[sorting_idx].reshape(-1, 1)
+        self._dist_err = dist_err[sorting_idx].reshape(-1, 1)
+
+    @staticmethod
+    def empty_frame():
+        return FrameCorners(
+            np.array([]).reshape((-1, 1)).astype(int),
+            np.array([]).reshape((-1, 2)).astype(np.float32),
+            np.array([]).reshape((-1, 1)).astype(int),
+            np.array([]).reshape((-1, 1)).astype(np.float32),
+            np.array([]).reshape((-1, 1)).astype(np.float32)
+        )
 
     @property
     def ids(self):
@@ -63,10 +75,27 @@ class FrameCorners:
     def sizes(self):
         return self._sizes
 
+    @property
+    def min_eigenvals(self):
+        return self._min_eigenvals
+
+    @property
+    def dist_err(self):
+        return self._dist_err
+
     def __iter__(self):
         yield self.ids
         yield self.points
         yield self.sizes
+        yield self.min_eigenvals
+        yield self.dist_err
+
+    def add_points(self, ids, points, sizes, min_eigenvals, dist_err):
+        self._ids = np.concatenate((self._ids, ids.reshape((-1, 1))))
+        self._points = np.concatenate((self._points, points.reshape((-1, 2))))
+        self._sizes = np.concatenate((self._sizes, sizes.reshape((-1, 1))))
+        self._min_eigenvals = np.concatenate((self._min_eigenvals, min_eigenvals.reshape((-1, 1))))
+        self._dist_err = np.concatenate((self._dist_err, dist_err.reshape(-1, 1)))
 
 
 def filter_frame_corners(frame_corners: FrameCorners,
@@ -200,6 +229,18 @@ def calc_track_interval_mappings(corner_storage: CornerStorage) -> np.ndarray:
     return left, right
 
 
+'''
+def check_ids(corner_storage):
+    max_id = max(corners.ids.max() for corners in corner_storage)
+    m = np.full((max_id + 1,), -1)
+    for i, corners in enumerate(corner_storage):
+        if np.sum(m[corners.ids.flatten()] == 0):
+            print("Ups")
+        m[m == 1] = 0
+        m[corners.ids.flatten()] = 1
+'''
+
+
 def calc_track_len_array_mapping(corner_storage: CornerStorage) -> np.ndarray:
     """
     Calculate lengths of all tracks in the given corner storage.
@@ -227,6 +268,48 @@ def without_short_tracks(corner_storage: CornerStorage,
 
     def predicate(corners):
         return counter[corners.ids.flatten()] >= min_len
+
+    return StorageFilter(corner_storage, predicate)
+
+
+def calc_min_eigenval_array(corner_storage: CornerStorage) -> np.ndarray:
+    max_id = max(corners.ids.max() for corners in corner_storage)
+    min_eigenvals = np.ones((max_id + 1,))
+    for corners in corner_storage:
+        unique, unique_idx = np.unique(corners.ids, return_index=True)
+        min_eigenvals[unique] = np.minimum(min_eigenvals[unique],
+                                           corners.min_eigenvals.flatten()[unique_idx])
+    return min_eigenvals
+
+
+def without_small_eigenvals(corner_storage: CornerStorage,
+                            threshold: float) -> CornerStorage:
+
+    mask = (calc_min_eigenval_array(corner_storage) >= threshold)
+
+    def predicate(corners):
+        return mask[corners.ids.flatten()]
+
+    return StorageFilter(corner_storage, predicate)
+
+
+def calc_max_dist_err_array(corner_storage: CornerStorage) -> np.ndarray:
+    max_id = max(corners.ids.max() for corners in corner_storage)
+    max_dist_err = np.zeros((max_id + 1,))
+    for corners in corner_storage:
+        unique, unique_idx = np.unique(corners.ids, return_index=True)
+        max_dist_err[unique] = np.maximum(max_dist_err[unique],
+                                          corners.dist_err.flatten()[unique_idx])
+    return max_dist_err
+
+
+def without_huge_dist_err(corner_storage: CornerStorage,
+                          threshold: float) -> CornerStorage:
+
+    mask = (calc_max_dist_err_array(corner_storage) <= threshold)
+
+    def predicate(corners):
+        return mask[corners.ids.flatten()]
 
     return StorageFilter(corner_storage, predicate)
 
@@ -275,6 +358,10 @@ def create_cli(build):
             corner_storage = build(sequence)
         if file_to_dump is not None:
             dump(corner_storage, file_to_dump)
+
+        # corner_storage = without_huge_dist_err(corner_storage, 10)  # <----
+        #  corner_storage= without_short_tracks(corner_storage, 50)
+
         if show:
             click.echo(
                 "Press 'q' to stop, 'd' to go forward, 'a' to go backward, "

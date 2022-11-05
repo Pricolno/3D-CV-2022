@@ -165,17 +165,25 @@ def _calc_z_mask(points3d, view_mat, min_depth):
     return points3d_in_camera_space[2].flatten() >= min_depth
 
 
+def _calc_reprojection_error_mask_one_view(points3d, points2d, view_mat,
+                                           intrinsic_mat,
+                                           max_reprojection_error):
+    reproj_errs = compute_reprojection_errors(points3d, points2d,
+                                              intrinsic_mat @ view_mat)
+    return reproj_errs.flatten() < max_reprojection_error
+
+
 def _calc_reprojection_error_mask(points3d, points2d_1, points2d_2,
                                   view_mat_1, view_mat_2, intrinsic_mat,
                                   max_reprojection_error):
     # pylint:disable=too-many-arguments
-    reproj_errs_1 = compute_reprojection_errors(points3d, points2d_1,
-                                                intrinsic_mat @ view_mat_1)
-    reproj_errs2 = compute_reprojection_errors(points3d, points2d_2,
-                                               intrinsic_mat @ view_mat_2)
     reproj_err_mask = np.logical_and(
-        reproj_errs_1.flatten() < max_reprojection_error,
-        reproj_errs2.flatten() < max_reprojection_error
+        _calc_reprojection_error_mask_one_view(points3d, points2d_1,
+                                               view_mat_1, intrinsic_mat,
+                                               max_reprojection_error),
+        _calc_reprojection_error_mask_one_view(points3d, points2d_2,
+                                               view_mat_2, intrinsic_mat,
+                                               max_reprojection_error)
     )
     return reproj_err_mask
 
@@ -226,6 +234,28 @@ def triangulate_correspondences(correspondences: Correspondences,
     common_mask = reprojection_error_mask & z_mask & angle_mask
 
     return points3d[common_mask], correspondences.ids[common_mask], median_cos
+
+
+SolvePnPParameters = namedtuple(
+    'SolvePnPParameters',
+    ('max_reprojection_error', 'min_depth')
+)
+
+
+def solve_PnP(points_2d: np.ndarray, points_3d: np.array, intrinsic_mat: np.ndarray,
+              parameters: SolvePnPParameters):
+    _, initial_rvec, initial_tvec, inliers = cv2.solvePnPRansac(points_3d, points_2d,
+                                                                intrinsic_mat, distCoeffs=None)
+    rvec, tvec = cv2.solvePnPRefineLM(points_3d[inliers], points_2d[inliers],
+                                      intrinsic_mat, distCoeffs=None,
+                                      rvec=initial_rvec, tvec=initial_tvec)
+    view_mat = rodrigues_and_translation_to_view_mat3x4(rvec, tvec)
+    reproj_mask = _calc_reprojection_error_mask_one_view(points_3d, points_2d,
+                                                         view_mat, intrinsic_mat,
+                                                         parameters.max_reprojection_error)
+    z_mask = _calc_z_mask(points_3d, view_mat, parameters.min_depth)
+    inliers_mask = reproj_mask & z_mask
+    return view_mat, inliers_mask
 
 
 def check_inliers_mask(inliers_mask: np.ndarray,
@@ -284,8 +314,15 @@ class PointCloudBuilder:
     def add_points(self, ids: np.ndarray, points: np.ndarray) -> None:
         ids = ids.reshape(-1, 1)
         points = points.reshape(-1, 3)
+        #print(f'self.ids={self.ids.flatten()},  ids={ids.flatten()}')
+
+        #if self.ids.flatten().shape[0] == 0:
+        #    idx_1 = np.array([], int)
+        #    idx_2 = np.array([], int)
+        #else:
         _, (idx_1, idx_2) = snp.intersect(self.ids.flatten(), ids.flatten(),
                                           indices=True)
+
         self.points[idx_1] = points[idx_2]
         self._ids = np.vstack((self.ids, np.delete(ids, idx_2, axis=0)))
         self._points = np.vstack((self.points, np.delete(points, idx_2, axis=0)))

@@ -270,6 +270,7 @@ def _describe_and_check_corners(corner_storage):
     return corners_ok
 
 
+
 def _describe_and_check_camera_track_errors(r_errors, t_errors,
                                             translation_error_allowed,
                                             rotation_deg_error_allowed):
