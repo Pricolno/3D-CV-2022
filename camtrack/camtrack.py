@@ -6,6 +6,7 @@ __all__ = [
 
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 import sortednp as snp
 import random
@@ -13,6 +14,9 @@ import random
 from corners import CornerStorage, FrameCorners
 from data3d import CameraParameters, PointCloud, Pose
 import frameseq
+
+from scipy.spatial.transform import Rotation
+
 from _camtrack import (
     PointCloudBuilder,
     create_cli,
@@ -25,7 +29,9 @@ from _camtrack import (
     TriangulationParameters,
     to_camera_center,
     solve_PnP,
-    SolvePnPParameters
+    SolvePnPParameters,
+    Correspondences,
+    rodrigues_and_translation_to_view_mat3x4
 )
 
 
@@ -33,67 +39,93 @@ def find_and_add_points3d(point_cloud_builder: PointCloudBuilder,
                           view_mat_1: np.ndarray, view_mat_2: np.ndarray,
                           intrinsic_mat: np.ndarray,
                           corners_1: FrameCorners, corners_2: FrameCorners,
-                          max_reproj_error: float = 0.6) -> PointCloudBuilder:
-    params = TriangulationParameters(max_reproj_error, 0, 0.05)
+                          params: TriangulationParameters) -> PointCloudBuilder:
     correspondence = build_correspondences(corners_1, corners_2)
-    points3d, ids, median_cos = triangulate_correspondences(correspondence, view_mat_1, view_mat_2, intrinsic_mat,
+    points3d, ids, median_cos = triangulate_correspondences(correspondence,
+                                                            view_mat_1,
+                                                            view_mat_2,
+                                                            intrinsic_mat,
                                                             params)
 
-    #print(f'point_cloud_builder.ids={point_cloud_builder.ids}\n point_cloud_builder._ids={point_cloud_builder._ids}')
-    point_cloud_builder.add_points(ids, points3d)
+    # print(f'point_cloud_builder.ids={point_cloud_builder.ids}\n point_cloud_builder._ids={point_cloud_builder._ids}')
+
+    if median_cos < params.max_reprojection_error:
+        point_cloud_builder.add_points(ids, points3d)
+        # print(f"ADED POINTS TO CLOUD erorr={median_cos}")
+    else:
+        # print(f"DONT ADED POINTS TO CLOUD error={median_cos}")
+        pass
     return point_cloud_builder
 
 
-def calc_camera_pose(point_cloud_builder: PointCloudBuilder, corners: FrameCorners,
-                     intrinsic_mat: np.ndarray, max_reproj_error: float = 0.5):
-    _, (idx_1, idx_2) = snp.intersect(point_cloud_builder.ids.flatten(), corners.ids.flatten(),
-                                      indices=True)
-    points_3d = point_cloud_builder.points[idx_1]
-    points_2d = corners.points[idx_2]
-    params = SolvePnPParameters(max_reproj_error,
-                                0)
-    view_mat, inliers_mask = solve_PnP(points_2d,
-                                       points_3d,
-                                       intrinsic_mat,
-                                       params)
-    return view_mat
-
-
-def check_distance_between_cameras(view_mat_1: np.array, view_mat_2: np.array) -> bool:
-    pose_1 = to_camera_center(view_mat_1)
-    pose_2 = to_camera_center(view_mat_2)
-    return np.linalg.norm(pose_1 - pose_2) > 0.2
-
-
-def frame_by_frame_calc(point_cloud_builder: PointCloudBuilder, corner_storage: CornerStorage,
-                        view_mats: np.array, known_views: list,
-                        intrinsic_mat: np.ndarray):
-    random.seed(42)
+def frame_by_frame_calc(point_cloud_builder: PointCloudBuilder,
+                        corner_storage: CornerStorage,
+                        view_mats: np.array,
+                        known_views: list,
+                        intrinsic_mat: np.ndarray,
+                        params: TriangulationParameters):
+    # random.seed(42)
     n_frames = len(corner_storage)
-    step = int(np.sqrt(n_frames))
 
-    for frame in range(0, n_frames, step):
-        if frame in known_views:
-            continue
-        view_mats[frame] = calc_camera_pose(point_cloud_builder, corner_storage[frame], intrinsic_mat)
-        if frame > 0:
-            prev_frame = frame - step
+    flag_camera = [False] * n_frames
+    for frame in known_views:
+        flag_camera[frame] = True
+
+    for find_new_frame in range(2, n_frames):
+        next_ids_3d, next_points_3d, _ = point_cloud_builder.build_point_cloud()
+
+        is_find_frame = False
+        next_frame = None
+        # sort out confidence for next frame
+        for per_confidence in range(99, 0, -1):
+            if is_find_frame:
+                break
+            confidence = per_confidence / 100.0
+
+            for next_frame in range(n_frames):
+                if flag_camera[next_frame]:
+                    continue
+                now_corner = corner_storage[next_frame]
+                now_ids, (now_id_1, now_id_2) = \
+                    snp.intersect(now_corner.ids.ravel(),
+                                  next_ids_3d.ravel(),
+                                  indices=True)
+                if len(now_ids) < 4:
+                    continue
+                # print(f"Confidence={confidence}")
+                is_find_frame, rot_vec, t_vec, inliners = \
+                    cv2.solvePnPRansac(objectPoints=next_points_3d[now_id_2],
+                                       imagePoints=now_corner.points[now_id_1],
+                                       cameraMatrix=intrinsic_mat,
+                                       distCoeffs=None,
+                                       confidence=confidence,
+                                       iterationsCount=270,
+                                       reprojectionError=1
+                                       )
+
+                if is_find_frame:
+                    break
+
+        # print(find_new_frame)
+        if not is_find_frame:
+            raise Exception('Confidence step 0.1 is not enough')
+
+        view_mats[next_frame] = rodrigues_and_translation_to_view_mat3x4(rot_vec, t_vec)
+        flag_camera[next_frame] = True
+
+        for prepared_frame in range(n_frames):
+            if not flag_camera[prepared_frame]:
+                continue
+            if prepared_frame == next_frame:
+                continue
+
             point_cloud_builder = find_and_add_points3d(point_cloud_builder,
-                                                        view_mats[frame], view_mats[prev_frame],
+                                                        view_mats[prepared_frame],
+                                                        view_mats[next_frame],
                                                         intrinsic_mat,
-                                                        corner_storage[frame], corner_storage[prev_frame])
-
-    for frame in range(n_frames):
-        if frame not in known_views:
-            view_mats[frame] = calc_camera_pose(point_cloud_builder, corner_storage[frame], intrinsic_mat)
-            for _ in range(2):
-                frame_2 = random.randint(0, n_frames//step - 1) * step
-                if check_distance_between_cameras(view_mats[frame], view_mats[frame_2]):
-                    point_cloud_builder = find_and_add_points3d(point_cloud_builder,
-                                                                view_mats[frame], view_mats[frame_2],
-                                                                intrinsic_mat,
-                                                                corner_storage[frame], corner_storage[frame_2],
-                                                                max_reproj_error=0.5)
+                                                        corner_storage[prepared_frame],
+                                                        corner_storage[next_frame],
+                                                        params)
 
     return view_mats
 
@@ -112,33 +144,40 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         camera_parameters,
         rgb_sequence[0].shape[0]
     )
+    # ('max_reprojection_error', 'min_triangulation_angle_deg', 'min_depth')
+    params = TriangulationParameters(1, 0.9, 0.4)
 
     # TODO: implement
     frame_count = len(corner_storage)
     view_mats = [pose_to_view_mat3x4(known_view_1[1])] * frame_count
     view_mats[known_view_2[0]] = pose_to_view_mat3x4(known_view_2[1])
 
-    corners_0 = corner_storage[0]
-    point_cloud_builder = PointCloudBuilder(corners_0.ids[:1],
-                                            np.zeros((1, 3)))
-
+    point_cloud_builder = PointCloudBuilder()
+    # corners_0 = corner_storage[0]
+    # point_cloud_builder = PointCloudBuilder(corners_0.ids[:1],
+    #                                         np.zeros((1, 3)))
 
     known_id1, known_id2 = known_view_1[0], known_view_2[0]
 
-    #print(f"corner_storage={corner_storage._corners}")
-    #print(f"corner_storage[known_id1]={corner_storage[known_id1]._corners}")
-    #point_cloud_builder = PointCloudBuilder()
     point_cloud_builder = find_and_add_points3d(point_cloud_builder,
                                                 pose_to_view_mat3x4(known_view_1[1]),
                                                 pose_to_view_mat3x4(known_view_2[1]),
                                                 intrinsic_mat,
-                                                corner_storage[known_id1], corner_storage[known_id2])
+                                                corner_storage[known_id1],
+                                                corner_storage[known_id2],
+                                                params
+                                                )
 
-    # best_id = (known_id1 + known_id2)//2
     # view_mats[best_id] = calc_camera_pose(point_cloud_builder, corner_storage[best_id], intrinsic_mat)
-    view_mats = frame_by_frame_calc(point_cloud_builder, corner_storage,
-                                    view_mats, [known_id1, known_id2], intrinsic_mat)
 
+    view_mats = frame_by_frame_calc(point_cloud_builder,
+                                    corner_storage,
+                                    view_mats,
+                                    [known_id1, known_id2],
+                                    intrinsic_mat,
+                                    params)
+
+    #
     calc_point_cloud_colors(
         point_cloud_builder,
         rgb_sequence,

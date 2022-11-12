@@ -1,0 +1,50 @@
+py ./camtrack.py 
+--camera-poses dataset/fox_head_full/ground_truth.yml
+--frame-1 1
+--frame-2 10
+dataset/fox_head_full/rgb.mov
+dataset/fox_head_full/camera.yml
+dataset/track.yml
+dataset/corners.yml
+
+# fox_full
+py ./camtrack.py --camera-poses dataset/fox_head_full/ground_truth.yml --frame-1 1 --frame-2 10 dataset/fox_head_full/rgb.mov dataset/fox_head_full/camera.yml dataset/track.yml dataset/corners.yml
+
+py ./camtrack.py --show --camera-poses dataset/fox_head_full/ground_truth.yml --frame-1 10 --frame-2 40 dataset/fox_head_full/rgb.mov dataset/fox_head_full/camera.yml dataset/track.yml dataset/corners.yml
+
+# room
+py ./camtrack.py --camera-poses dataset/room/ground_truth.yml --frame-1 1 --frame-2 10 dataset/room/rgb.mov dataset/room/camera.yml dataset/room/track.yml dataset/room/corners.yml
+
+# room show
+py ./camtrack.py --show --camera-poses dataset/room/ground_truth.yml --frame-1 10 --frame-2 40 dataset/room/rgb.mov dataset/room/camera.yml dataset/room/track.yml dataset/room/corners.yml
+
+
+# room corners
+ py corners.py .\dataset\room\rgb.mov --show
+
+py corners.py --dump-corners ./dataset/room/rgb.mov.dump ./dataset/room/rgb.mov
+py camtrack.py --camera-poses ./dataset/room/ground_truth.yml --load-corners ./dataset/room/rgb.mov.dump --frame-1 10 --frame-2 40 --show ./dataset/room/rgb.mov ./dataset/room/camera.yml ./dataset/room/track.yml ./dataset/room/point_cloud.yml
+py cmptrack.py ./dataset/room/ground_truth.yml ./dataset/room/track.yml
+py render.py dataset/room/camera.yml dataset/room/track.yml dataset/room/point_cloud.yml
+
+
+
+
+# corners fox
+ py corners.py .\dataset\fox_head_full\rgb.mov --show
+
+
+
+py corners.py --dump-corners dataset/corners.yml dataset/fox_head_full/rgb.mov
+
+
+py .\testrunner.py
+--camera-poses dataset/fox_head_full/ground_truth.yml
+--frame-1 1
+--frame-2 10
+dataset/fox_head_full/rgb.mov
+dataset/fox_head_full/camera.yml
+dataset/track.yml
+dataset/corners.yml
+
+py .\testrunner.py --camera-poses dataset/fox_head_full/ground_truth.yml --frame-1 1 --frame-2 10 dataset/fox_head_full/rgb.mov dataset/fox_head_full/camera.yml dataset/track.yml dataset/corners.yml

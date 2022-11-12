@@ -242,7 +242,9 @@ SolvePnPParameters = namedtuple(
 )
 
 
-def solve_PnP(points_2d: np.ndarray, points_3d: np.array, intrinsic_mat: np.ndarray,
+def solve_PnP(points_2d: np.ndarray,
+              points_3d: np.array,
+              intrinsic_mat: np.ndarray,
               parameters: SolvePnPParameters):
     _, initial_rvec, initial_tvec, inliers = cv2.solvePnPRansac(points_3d, points_2d,
                                                                 intrinsic_mat, distCoeffs=None)
@@ -289,8 +291,8 @@ class PointCloudBuilder:
     def __init__(self, ids: np.ndarray = None, points: np.ndarray = None,
                  colors: np.ndarray = None) -> None:
         super().__init__()
-        self._ids = ids if ids is not None else np.array([], dtype=np.int64)
-        self._points = points if points is not None else np.array([])
+        self._ids = ids if ids is not None else np.array([], dtype=np.int32)
+        self._points = points if points is not None else np.array([], dtype=np.int32)
         self._colors = colors
         self._sort_data()
 

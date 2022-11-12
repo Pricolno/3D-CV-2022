@@ -195,13 +195,13 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     
     # params for ShiTomasi corner detection
     feature_params = dict(maxCorners=1500,
-                          qualityLevel=0.05,
-                          minDistance=7,
+                          qualityLevel=0.01,
+                          minDistance=5,
                           blockSize=7)
 
     # Parameters for Lucas-Kanade optical flow
     lk_params = dict(winSize=(15, 15),
-                     maxLevel=2,
+                     maxLevel=3,
                      criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 10, 0.01),
                      minEigThreshold=1e-3)  # 1.5*1e-2)
 
