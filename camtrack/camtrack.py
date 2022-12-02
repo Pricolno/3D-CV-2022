@@ -3,6 +3,7 @@
 __all__ = [
     'track_and_calc_colors'
 ]
+from tqdm import tqdm
 
 from typing import List, Optional, Tuple
 
@@ -10,12 +11,16 @@ import cv2
 import numpy as np
 import sortednp as snp
 import random
+from itertools import combinations
+
+from pims import FramesSequence
 
 from corners import CornerStorage, FrameCorners
 from data3d import CameraParameters, PointCloud, Pose
 import frameseq
 
 from scipy.spatial.transform import Rotation
+import scipy
 
 from _camtrack import (
     PointCloudBuilder,
@@ -71,11 +76,14 @@ def frame_by_frame_calc(point_cloud_builder: PointCloudBuilder,
     for frame in known_views:
         flag_camera[frame] = True
 
-    for find_new_frame in range(2, n_frames):
+    for find_new_frame in tqdm(range(2, n_frames), desc="Frame_by_frame_calc"):
         next_ids_3d, next_points_3d, _ = point_cloud_builder.build_point_cloud()
 
         is_find_frame = False
+
         next_frame = None
+        inliers = None
+        now_id_2 = None
         # sort out confidence for next frame
         for per_confidence in range(99, 0, -1):
             if is_find_frame:
@@ -93,22 +101,25 @@ def frame_by_frame_calc(point_cloud_builder: PointCloudBuilder,
                 if len(now_ids) < 4:
                     continue
                 # print(f"Confidence={confidence}")
-                is_find_frame, rot_vec, t_vec, inliners = \
+                is_find_frame, rot_vec, t_vec, inliers = \
                     cv2.solvePnPRansac(objectPoints=next_points_3d[now_id_2],
                                        imagePoints=now_corner.points[now_id_1],
                                        cameraMatrix=intrinsic_mat,
                                        distCoeffs=None,
                                        confidence=confidence,
-                                       iterationsCount=270,
-                                       reprojectionError=1
+                                       iterationsCount=400,
+                                       reprojectionError=1.2
                                        )
-
                 if is_find_frame:
                     break
 
         # print(find_new_frame)
         if not is_find_frame:
             raise Exception('Confidence step 0.1 is not enough')
+
+        outliers = np.setdiff1d(np.arange(0, len(next_points_3d[now_id_2])), inliers.T, assume_unique=True)
+        point_cloud_builder.remove_points(outliers)
+        print(f"Found {len(inliers)} inliners for next_frame={next_frame}. Remove {len(outliers)} outliers")
 
         view_mats[next_frame] = rodrigues_and_translation_to_view_mat3x4(rot_vec, t_vec)
         flag_camera[next_frame] = True
@@ -127,7 +138,82 @@ def frame_by_frame_calc(point_cloud_builder: PointCloudBuilder,
                                                         corner_storage[next_frame],
                                                         params)
 
+
     return view_mats
+
+
+def find_start_position_camers(corner_storage: CornerStorage,
+                               intrinsic_mat: FramesSequence):
+    ratio = []
+    params_findEssentialMat = {
+        'method': cv2.RANSAC,
+        'prob': 0.999,
+        #'prob': 0.8,
+        'threshold': 1,
+        'maxIters': 5000
+        #'maxIters': 2000
+    }
+    params_findHomography = {
+        "method": cv2.RANSAC,
+        "ransacReprojThreshold": 0.9
+    }
+
+    THRESHHOLD_COUNT_FRAME = 100
+    BIG_FRAME_STEP = 10
+    SMALL_FRAME_STEP = 2
+
+    count_frames = len(corner_storage)
+    frame_step = BIG_FRAME_STEP
+    if count_frames < THRESHHOLD_COUNT_FRAME:
+        frame_step = SMALL_FRAME_STEP
+
+    for frame1 in tqdm(range(0, count_frames, frame_step), desc="\nFind_start_position_camers\n"):
+        for frame2 in range(frame1 + frame_step, count_frames, frame_step):
+            correspondence = build_correspondences(
+                corner_storage[frame1],
+                corner_storage[frame2]
+            )
+
+            _, mask_essential = cv2.findEssentialMat(
+                correspondence.points_1,
+                correspondence.points_2,
+                intrinsic_mat,
+                **params_findEssentialMat
+            )
+
+            _, mask_homography = cv2.findHomography(
+                correspondence.points_1,
+                correspondence.points_2,
+                **params_findHomography
+            )
+
+            ratio.append((frame1, frame2, np.count_nonzero(mask_essential) / np.count_nonzero(mask_homography)))
+
+    frame1, frame2, _ = sorted(ratio, key=lambda x: x[2])[-1]
+
+    correspondence = build_correspondences(
+        corner_storage[frame1],
+        corner_storage[frame2],
+    )
+
+    essential_matrix, _ = cv2.findEssentialMat(
+        correspondence.points_1,
+        correspondence.points_2,
+        intrinsic_mat,
+        **params_findEssentialMat
+    )
+
+    _, R, t, _ = cv2.recoverPose(
+        essential_matrix,
+        correspondence.points_1,
+        correspondence.points_2,
+        intrinsic_mat
+    )
+
+    known_view_1 = (frame1, Pose(r_mat=np.eye(3), t_vec=np.zeros(3)))
+    known_view_2 = (frame2, Pose(R.T, R.T @ -t))
+
+    return known_view_1, known_view_2
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -136,14 +222,18 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
-    if known_view_1 is None or known_view_2 is None:
-        raise NotImplementedError()
-
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
         camera_parameters,
         rgb_sequence[0].shape[0]
     )
+
+    if known_view_1 is None or known_view_1 is None:
+        print("There are not start's views. Start finding two first position:")
+        known_view_1, known_view_2 = find_start_position_camers(corner_storage, intrinsic_mat)
+    else:
+        print("There are start's views")
+
     # ('max_reprojection_error', 'min_triangulation_angle_deg', 'min_depth')
     params = TriangulationParameters(1, 0.9, 0.4)
 
