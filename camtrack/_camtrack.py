@@ -114,14 +114,15 @@ def _calc_triangulation_angle_mask(view_mat_1: np.ndarray,
     vecs_2 = normalize(camera_center_2 - points3d)
     coss_abs = np.abs(np.einsum('ij,ij->i', vecs_1, vecs_2))
     angles_mask = coss_abs <= np.cos(np.deg2rad(min_angle_deg))
+
     return angles_mask, np.median(coss_abs)
+    #return angles_mask, np.median(coss_abs[angles_mask])
 
 
 Correspondences = namedtuple(
     'Correspondences',
     ('ids', 'points_1', 'points_2')
 )
-
 
 TriangulationParameters = namedtuple(
     'TriangulationParameters',
@@ -165,17 +166,25 @@ def _calc_z_mask(points3d, view_mat, min_depth):
     return points3d_in_camera_space[2].flatten() >= min_depth
 
 
+def _calc_reprojection_error_mask_one_view(points3d, points2d, view_mat,
+                                           intrinsic_mat,
+                                           max_reprojection_error):
+    reproj_errs = compute_reprojection_errors(points3d, points2d,
+                                              intrinsic_mat @ view_mat)
+    return reproj_errs.flatten() < max_reprojection_error
+
+
 def _calc_reprojection_error_mask(points3d, points2d_1, points2d_2,
                                   view_mat_1, view_mat_2, intrinsic_mat,
                                   max_reprojection_error):
     # pylint:disable=too-many-arguments
-    reproj_errs_1 = compute_reprojection_errors(points3d, points2d_1,
-                                                intrinsic_mat @ view_mat_1)
-    reproj_errs2 = compute_reprojection_errors(points3d, points2d_2,
-                                               intrinsic_mat @ view_mat_2)
     reproj_err_mask = np.logical_and(
-        reproj_errs_1.flatten() < max_reprojection_error,
-        reproj_errs2.flatten() < max_reprojection_error
+        _calc_reprojection_error_mask_one_view(points3d, points2d_1,
+                                               view_mat_1, intrinsic_mat,
+                                               max_reprojection_error),
+        _calc_reprojection_error_mask_one_view(points3d, points2d_2,
+                                               view_mat_2, intrinsic_mat,
+                                               max_reprojection_error)
     )
     return reproj_err_mask
 
@@ -183,8 +192,8 @@ def _calc_reprojection_error_mask(points3d, points2d_1, points2d_2,
 def triangulate_correspondences(correspondences: Correspondences,
                                 view_mat_1: np.ndarray, view_mat_2: np.ndarray,
                                 intrinsic_mat: np.ndarray,
-                                parameters: TriangulationParameters) \
-        -> Tuple[np.ndarray, np.ndarray, float]:
+                                triangulation_parameters: TriangulationParameters) \
+        -> Tuple[np.ndarray, np.ndarray, None, float]:
     points2d_1 = correspondences.points_1
     points2d_2 = correspondences.points_2
 
@@ -199,10 +208,17 @@ def triangulate_correspondences(correspondences: Correspondences,
         np.array([])
     ).reshape(-1, 2)
 
+    # print(f"\nview_mat_1={view_mat_1}")
+    # print(f"view_mat_2={view_mat_2}")
     points3d = cv2.triangulatePoints(view_mat_1, view_mat_2,
                                      normalized_points2d_1.T,
                                      normalized_points2d_2.T)
     points3d = cv2.convertPointsFromHomogeneous(points3d.T).reshape(-1, 3)
+
+    # errors3d = _calc_3d_errors(
+    #     points3d, view_mat_1, view_mat_2,
+    #     correspondences.errors_1, correspondences.errors_2
+    # )
 
     reprojection_error_mask = _calc_reprojection_error_mask(
         points3d,
@@ -211,21 +227,45 @@ def triangulate_correspondences(correspondences: Correspondences,
         view_mat_1,
         view_mat_2,
         intrinsic_mat,
-        parameters.max_reprojection_error
+        triangulation_parameters.max_reprojection_error
     )
     z_mask = np.logical_and(
-        _calc_z_mask(points3d, view_mat_1, parameters.min_depth),
-        _calc_z_mask(points3d, view_mat_2, parameters.min_depth)
+        _calc_z_mask(points3d, view_mat_1, triangulation_parameters.min_depth),
+        _calc_z_mask(points3d, view_mat_2, triangulation_parameters.min_depth)
     )
     angle_mask, median_cos = _calc_triangulation_angle_mask(
         view_mat_1,
         view_mat_2,
         points3d,
-        parameters.min_triangulation_angle_deg
+        triangulation_parameters.min_triangulation_angle_deg
     )
     common_mask = reprojection_error_mask & z_mask & angle_mask
 
-    return points3d[common_mask], correspondences.ids[common_mask], median_cos
+    return points3d[common_mask], correspondences.ids[common_mask], None, median_cos
+
+
+SolvePnPParameters = namedtuple(
+    'SolvePnPParameters',
+    ('max_reprojection_error', 'min_depth')
+)
+
+
+def solve_PnP(points_2d: np.ndarray,
+              points_3d: np.array,
+              intrinsic_mat: np.ndarray,
+              parameters: SolvePnPParameters):
+    _, initial_rvec, initial_tvec, inliers = cv2.solvePnPRansac(points_3d, points_2d,
+                                                                intrinsic_mat, distCoeffs=None)
+    rvec, tvec = cv2.solvePnPRefineLM(points_3d[inliers], points_2d[inliers],
+                                      intrinsic_mat, distCoeffs=None,
+                                      rvec=initial_rvec, tvec=initial_tvec)
+    view_mat = rodrigues_and_translation_to_view_mat3x4(rvec, tvec)
+    reproj_mask = _calc_reprojection_error_mask_one_view(points_3d, points_2d,
+                                                         view_mat, intrinsic_mat,
+                                                         parameters.max_reprojection_error)
+    z_mask = _calc_z_mask(points_3d, view_mat, parameters.min_depth)
+    inliers_mask = reproj_mask & z_mask
+    return view_mat, inliers_mask
 
 
 def check_inliers_mask(inliers_mask: np.ndarray,
@@ -245,22 +285,24 @@ def check_baseline(view_mat_1: np.ndarray, view_mat_2: np.ndarray,
     return distance >= min_distance
 
 
-def rodrigues_and_translation_to_view_mat3x4(r_vec: np.ndarray,
-                                             t_vec: np.ndarray) -> np.ndarray:
-    rot_mat, _ = cv2.Rodrigues(r_vec)
+def rodrigues_and_translation_to_view_mat3x4(r_vec: np.ndarray = None,
+                                             t_vec: np.ndarray = None,
+                                             rot_mat=None) -> np.ndarray:
+    if rot_mat is None:
+        rot_mat, _ = cv2.Rodrigues(r_vec)
     view_mat = np.hstack((rot_mat, t_vec))
+    # print(f"rot_mat={rot_mat} | t_vec={t_vec} | view_mat={view_mat}")
     return view_mat
 
 
 class PointCloudBuilder:
-
     __slots__ = ('_ids', '_points', '_colors')
 
     def __init__(self, ids: np.ndarray = None, points: np.ndarray = None,
                  colors: np.ndarray = None) -> None:
         super().__init__()
-        self._ids = ids if ids is not None else np.array([], dtype=np.int64)
-        self._points = points if points is not None else np.array([])
+        self._ids = ids if ids is not None else np.array([], dtype=np.int32)
+        self._points = points if points is not None else np.array([], dtype=np.int32)
         self._colors = colors
         self._sort_data()
 
@@ -284,11 +326,27 @@ class PointCloudBuilder:
     def add_points(self, ids: np.ndarray, points: np.ndarray) -> None:
         ids = ids.reshape(-1, 1)
         points = points.reshape(-1, 3)
+        # print(f'self.ids={self.ids.flatten()},  ids={ids.flatten()}')
+
+        # if self.ids.flatten().shape[0] == 0:
+        #    idx_1 = np.array([], int)
+        #    idx_2 = np.array([], int)
+        # else:
         _, (idx_1, idx_2) = snp.intersect(self.ids.flatten(), ids.flatten(),
                                           indices=True)
+
         self.points[idx_1] = points[idx_2]
         self._ids = np.vstack((self.ids, np.delete(ids, idx_2, axis=0)))
         self._points = np.vstack((self.points, np.delete(points, idx_2, axis=0)))
+        self._sort_data()
+
+    def remove_points(self, ids_to_remove: np.ndarray) -> None:
+        self._ids = np.delete(self.ids, ids_to_remove, axis=0)
+        self._points = np.delete(self.points, ids_to_remove, axis=0)
+
+        if (not (self.colors is None)):
+            self._colors = np.delete(self.colors, ids_to_remove, axis=0)
+
         self._sort_data()
 
     def set_colors(self, colors: np.ndarray) -> None:
@@ -382,11 +440,11 @@ def calc_point_cloud_colors(pc_builder: PointCloudBuilder,
                 errors = np.nan_to_num(errors)
 
             consistency_mask = (
-                (errors <= max_reproj_error) &
-                (corners.points[:, 0] >= 0) &
-                (corners.points[:, 1] >= 0) &
-                (corners.points[:, 0] < image.shape[1] - 0.5) &
-                (corners.points[:, 1] < image.shape[0] - 0.5)).flatten()
+                    (errors <= max_reproj_error) &
+                    (corners.points[:, 0] >= 0) &
+                    (corners.points[:, 1] >= 0) &
+                    (corners.points[:, 0] < image.shape[1] - 0.5) &
+                    (corners.points[:, 1] < image.shape[0] - 0.5)).flatten()
             ids_to_process = corners.ids[consistency_mask].flatten()
             corner_points = np.round(
                 corners.points[consistency_mask]
@@ -481,4 +539,5 @@ def create_cli(track_and_calc_colors):
                     frame += 1
                 if key == 'q':
                     break
+
     return cli
