@@ -119,7 +119,7 @@ def create_mask_by_corners(image, corners, compress_rate=1):
     return mask
 
 
-def add_corners(image, feature_params, max_corner_id, corners=None, max_pyramid_lvl=4):
+def add_corners(image, feature_params, max_corner_id, corners=None, max_pyramid_lvl=0):
     if corners is not None:
         mask = create_mask_by_corners(image, corners)
     else:
@@ -133,7 +133,7 @@ def add_corners(image, feature_params, max_corner_id, corners=None, max_pyramid_
         if new_p is not None:
             new_p = new_p.reshape((-1, 2)) * compress_rate
             n = new_p.shape[0]
-            new_sizes = np.full(n, feature_params['blockSize']*compress_rate).reshape((-1, 1))
+            new_sizes = np.full(n, feature_params['blockSize'] * compress_rate).reshape((-1, 1))
             new_ids = np.arange(max_corner_id, max_corner_id + n)
             max_corner_id += n
             corners.add_points(new_ids, new_p, new_sizes, np.ones((n, 1)), np.zeros((n, 1)))
@@ -151,7 +151,7 @@ def lk_params_for_pyramid_lvl(lk_params, compress_rate):
     return lk_p_params
 
 
-def track_corners(image_0, image_1, corners, lk_params, max_pyramid_lvl=4):
+def track_corners(image_0, image_1, corners, lk_params, max_pyramid_lvl=0):
     compress_rate = 1
     small_img0 = image_0
     small_img1 = image_1
@@ -194,9 +194,9 @@ def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
     
     # params for ShiTomasi corner detection
-    feature_params = dict(maxCorners=3000,
-                          qualityLevel=0.001,
-                          minDistance=7,
+    feature_params = dict(maxCorners=1000,
+                          qualityLevel=0.02,
+                          minDistance=10,
                           blockSize=7)
 
     # Parameters for Lucas-Kanade optical flow
@@ -210,6 +210,7 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     corners, max_corner_id = add_corners(image_0, feature_params, max_corner_id)
     builder.set_corners_at_frame(0, corners)
 
+    last_max_corner_id = 0
     for frame, image_1 in enumerate(frame_sequence[1:], 1):
         image_1 = (image_1 * 255.0).astype(np.uint8)
         corners = track_corners(image_0, image_1, corners, lk_params)
@@ -221,6 +222,8 @@ def _build_impl(frame_sequence: pims.FramesSequence,
         builder.set_corners_at_frame(frame, corners)
         image_0 = image_1
 
+        print(f"_build_impl | max_corner_id={max_corner_id} | delta_cnt_corners={max_corner_id - last_max_corner_id}")
+        last_max_corner_id = max_corner_id
 
 def build(frame_sequence: pims.FramesSequence,
           progress: bool = True) -> CornerStorage:

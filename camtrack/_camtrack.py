@@ -296,14 +296,15 @@ def rodrigues_and_translation_to_view_mat3x4(r_vec: np.ndarray = None,
 
 
 class PointCloudBuilder:
-    __slots__ = ('_ids', '_points', '_colors')
+    __slots__ = ('_ids', '_points', '_errors', '_colors')
 
     def __init__(self, ids: np.ndarray = None, points: np.ndarray = None,
-                 colors: np.ndarray = None) -> None:
+                 errors: np.ndarray = None, colors: np.ndarray = None) -> None:
         super().__init__()
         self._ids = ids if ids is not None else np.array([], dtype=np.int32)
         self._points = points if points is not None else np.array([], dtype=np.int32)
         self._colors = colors
+        self._errors = errors if errors is not None else np.array([])
         self._sort_data()
 
     @property
@@ -315,6 +316,10 @@ class PointCloudBuilder:
         return self._points
 
     @property
+    def errors(self) -> np.ndarray:
+        return self._errors
+
+    @property
     def colors(self) -> np.ndarray:
         return self._colors
 
@@ -323,22 +328,25 @@ class PointCloudBuilder:
         yield self.points
         yield self.colors
 
-    def add_points(self, ids: np.ndarray, points: np.ndarray) -> None:
+    def add_points(self, ids: np.ndarray, points: np.ndarray, errors: np.ndarray = None):
         ids = ids.reshape(-1, 1)
         points = points.reshape(-1, 3)
-        # print(f'self.ids={self.ids.flatten()},  ids={ids.flatten()}')
+        #errors = errors.reshape(-1, 1)
 
-        # if self.ids.flatten().shape[0] == 0:
-        #    idx_1 = np.array([], int)
-        #    idx_2 = np.array([], int)
-        # else:
         _, (idx_1, idx_2) = snp.intersect(self.ids.flatten(), ids.flatten(),
                                           indices=True)
+
+        #mask_new = (self._errors[idx_1] > errors[idx_2]).flatten()
+        #self._points[idx_1[mask_new]] = points[idx_2[mask_new]]
+        #self._errors[idx_1[mask_new]] = errors[idx_2[mask_new]]
 
         self.points[idx_1] = points[idx_2]
         self._ids = np.vstack((self.ids, np.delete(ids, idx_2, axis=0)))
         self._points = np.vstack((self.points, np.delete(points, idx_2, axis=0)))
+        #self._errors = np.vstack((self.errors, np.delete(errors, idx_2, axis=0)))
         self._sort_data()
+
+        #return np.sum(mask_new)
 
     def remove_points(self, ids_to_remove: np.ndarray) -> None:
         self._ids = np.delete(self.ids, ids_to_remove, axis=0)
@@ -353,6 +361,7 @@ class PointCloudBuilder:
         assert self._ids.size == colors.shape[0]
         self._colors = colors
 
+
     def update_points(self, ids: np.ndarray, points: np.ndarray) -> None:
         _, (idx_1, idx_2) = snp.intersect(self.ids.flatten(), ids.flatten(),
                                           indices=True)
@@ -365,6 +374,7 @@ class PointCloudBuilder:
         sorting_idx = np.argsort(self.ids.flatten())
         self._ids = self.ids[sorting_idx].reshape(-1, 1)
         self._points = self.points[sorting_idx].reshape(-1, 3)
+        #self._errors = self.errors[sorting_idx].reshape(-1, 1)
         if self.colors is not None:
             self._colors = self.colors[sorting_idx].reshape(-1, 3)
 
