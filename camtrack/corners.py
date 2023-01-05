@@ -119,7 +119,7 @@ def create_mask_by_corners(image, corners, compress_rate=1):
     return mask
 
 
-def add_corners(image, feature_params, max_corner_id, corners=None, max_pyramid_lvl=0):
+def add_corners(image, feature_params, max_corner_id, corners=None, max_pyramid_lvl=4):
     if corners is not None:
         mask = create_mask_by_corners(image, corners)
     else:
@@ -133,7 +133,7 @@ def add_corners(image, feature_params, max_corner_id, corners=None, max_pyramid_
         if new_p is not None:
             new_p = new_p.reshape((-1, 2)) * compress_rate
             n = new_p.shape[0]
-            new_sizes = np.full(n, feature_params['blockSize'] * compress_rate).reshape((-1, 1))
+            new_sizes = np.full(n, feature_params['blockSize']*compress_rate).reshape((-1, 1))
             new_ids = np.arange(max_corner_id, max_corner_id + n)
             max_corner_id += n
             corners.add_points(new_ids, new_p, new_sizes, np.ones((n, 1)), np.zeros((n, 1)))
@@ -151,7 +151,7 @@ def lk_params_for_pyramid_lvl(lk_params, compress_rate):
     return lk_p_params
 
 
-def track_corners(image_0, image_1, corners, lk_params, max_pyramid_lvl=0):
+def track_corners(image_0, image_1, corners, lk_params, max_pyramid_lvl=4):
     compress_rate = 1
     small_img0 = image_0
     small_img1 = image_1
@@ -167,13 +167,6 @@ def track_corners(image_0, image_1, corners, lk_params, max_pyramid_lvl=0):
 
         new_p, st, err = cv2.calcOpticalFlowPyrLK(small_img0, small_img1, curr_points/compress_rate,
                                                   cv2.OPTFLOW_LK_GET_MIN_EIGENVALS, **lk_p_params)
-
-        #p2, s2, err2 = cv2.calcOpticalFlowPyrLK(small_img0, small_img1, curr_points/compress_rate,
-        #                                        None, **lk_params)
-
-        #err2 = err2[s2==1].reshape(-1)
-
-        #print(f"here:\n err2 ~= {err2[0:5]},\n our ~= {l1_dist[0:5]},\n{np.sum(l1_dist != err2)}")
 
         if new_p is not None:
             new_p = new_p[np.hstack((st, st)) == 1].reshape((-1, 2))
@@ -195,35 +188,31 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     
     # params for ShiTomasi corner detection
     feature_params = dict(maxCorners=1000,
-                          qualityLevel=0.02,
-                          minDistance=10,
+                          qualityLevel=0.1, #0.2
+                          minDistance=7,
                           blockSize=7)
 
     # Parameters for Lucas-Kanade optical flow
     lk_params = dict(winSize=(15, 15),
-                     maxLevel=3,
+                     maxLevel=2,
                      criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 10, 0.01),
-                     minEigThreshold=5e-4)  # 1.5*1e-2)
+                     minEigThreshold=1e-4)  # 1e-3
 
     image_0 = (frame_sequence[0] * 255.0).astype(np.uint8)
     max_corner_id = 0
     corners, max_corner_id = add_corners(image_0, feature_params, max_corner_id)
     builder.set_corners_at_frame(0, corners)
 
-    last_max_corner_id = 0
     for frame, image_1 in enumerate(frame_sequence[1:], 1):
         image_1 = (image_1 * 255.0).astype(np.uint8)
         corners = track_corners(image_0, image_1, corners, lk_params)
         
-        #if frame % 5 == 0:
-        #    corners, max_corner_id = add_corners(image_1, feature_params, max_corner_id, corners)
+        if frame % 5 == 0:
+            corners, max_corner_id = add_corners(image_1, feature_params, max_corner_id, corners)
 
-        corners, max_corner_id = add_corners(image_1, feature_params, max_corner_id, corners)
         builder.set_corners_at_frame(frame, corners)
         image_0 = image_1
 
-        print(f"_build_impl | max_corner_id={max_corner_id} | delta_cnt_corners={max_corner_id - last_max_corner_id}")
-        last_max_corner_id = max_corner_id
 
 def build(frame_sequence: pims.FramesSequence,
           progress: bool = True) -> CornerStorage:

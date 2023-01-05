@@ -1,31 +1,24 @@
 #! /usr/bin/env python3
-from collections import OrderedDict
 
 __all__ = [
-    'track_and_calc_colors',
+    'track_and_calc_colors'
 ]
 
-from tqdm import tqdm
-
 from typing import List, Optional, Tuple
+from scipy.optimize import least_squares
 
-import cv2
 import numpy as np
 import sortednp as snp
 import random
-from itertools import combinations
-
-from pims import FramesSequence
+import cv2
+from tqdm import tqdm
 
 from corners import CornerStorage, FrameCorners
 from data3d import CameraParameters, PointCloud, Pose
 import frameseq
-
-from scipy.spatial.transform import Rotation
-import scipy
-
 from _camtrack import (
     PointCloudBuilder,
+    Correspondences,
     create_cli,
     calc_point_cloud_colors,
     pose_to_view_mat3x4,
@@ -37,46 +30,255 @@ from _camtrack import (
     to_camera_center,
     solve_PnP,
     SolvePnPParameters,
-    Correspondences,
-    rodrigues_and_translation_to_view_mat3x4,
-    _calc_triangulation_angle_mask,
     eye3x4,
-    compute_reprojection_errors,
-    calc_inlier_indices
+    calc_inlier_indices,
+    vec_to_views_points,
+    views_points_3d_to_vec,
+    calc_residuals_all, rodrigues_and_translation_to_view_mat3x4
 )
+
+from _corners import StorageImpl
+
+MAX_REPROJ_ERROR = 3
 
 
 def find_and_add_points3d(point_cloud_builder: PointCloudBuilder,
                           view_mat_1: np.ndarray, view_mat_2: np.ndarray,
                           intrinsic_mat: np.ndarray,
                           corners_1: FrameCorners, corners_2: FrameCorners,
-                          params: TriangulationParameters) -> PointCloudBuilder:
+                          max_reproj_error: float = MAX_REPROJ_ERROR) \
+        -> PointCloudBuilder:
+    params = TriangulationParameters(max_reproj_error, 0.1, 0.1)
     correspondence = build_correspondences(corners_1, corners_2)
-    points3d, ids, _, median_cos = triangulate_correspondences(correspondence,
-                                                               view_mat_1,
-                                                               view_mat_2,
-                                                               intrinsic_mat,
-                                                               params)
+    if correspondence.ids.shape[0] == 0:
+        print(f"No points to triangulate")
+        return point_cloud_builder
 
-    # print(f'point_cloud_builder.ids={point_cloud_builder.ids}\n point_cloud_builder._ids={point_cloud_builder._ids}')
+    points3d, ids, errors, _ = triangulate_correspondences(
+        correspondence,
+        view_mat_1,
+        view_mat_2,
+        intrinsic_mat,
+        params
+    )
 
-    if median_cos < params.max_reprojection_error:
-        point_cloud_builder.add_points(ids, points3d)
-        # print(f"ADED POINTS TO CLOUD erorr={median_cos}")
-    else:
-        # print(f"DONT ADED POINTS TO CLOUD error={median_cos}")
-        pass
+    n_updated = point_cloud_builder.add_points(ids, points3d, errors)
     return point_cloud_builder
 
 
-def check_distance_between_pair_cameras(view_mat_1: np.array, view_mat_2: np.array, min_dist=0.2) -> bool:
-    pose_center_1 = to_camera_center(view_mat_1)
-    pose_center_2 = to_camera_center(view_mat_2)
-    return np.linalg.norm(pose_center_1 - pose_center_2) > min_dist
+def choose_corners_for_PnP(corners: FrameCorners, present_ids: np.ndarray,
+                           image_shape: Tuple, min_dist: int) -> np.array:
+    w, h = image_shape
+    image_mask = np.ones(image_shape)
+    points = corners.points[present_ids]
+    corners_mask = []
+    sorting_ids = np.argsort(corners.min_eigenvals.flatten()[present_ids])
+    for i in sorting_ids:
+        x = int(points[i, 0])
+        y = int(points[i, 1])
+        if 0 <= x < w and 0 <= y < h and image_mask[x, y]:
+            corners_mask.append(i)
+            cv2.circle(image_mask, (x, y), min_dist, color=0, thickness=-1)
+
+    return np.array(corners_mask)
+
+
+def calc_camera_pose(point_cloud_builder: PointCloudBuilder,
+                     corners: FrameCorners, intrinsic_mat: np.ndarray,
+                     image_shape: Tuple,
+                     max_reproj_error: float = MAX_REPROJ_ERROR) \
+        -> Tuple[FrameCorners, np.array, float]:
+    _, (idx_1, idx_2) = snp.intersect(point_cloud_builder.ids.flatten(),
+                                      corners.ids.flatten(), indices=True)
+    best_ids = choose_corners_for_PnP(corners, idx_2, image_shape, 10)
+    points_3d = point_cloud_builder.points[idx_1[best_ids]]
+    points_2d = corners.points[idx_2[best_ids]]
+    params = SolvePnPParameters(max_reproj_error, 0)
+    if points_2d.shape[0] < 5:
+        print(f"calc_camera_pose | Too few points to solve PnP")
+        # raise RuntimeError("Too few points to solve PnP")
+        return corners, eye3x4(), 0
+
+    view_mat, inliers = solve_PnP(points_2d, points_3d, intrinsic_mat,params)
+
+    if view_mat is None or inliers is None:
+        # raise RuntimeError("Failed to calculate view_mat")
+        print("calc_camera_pose | Failed to calculate view_mat")
+        return corners, eye3x4(), 0
+
+    corners.relevant[idx_2[best_ids], :] = 0
+    corners.relevant[idx_2[best_ids[inliers.flatten()]], 0] = 1
+    n_inliers = inliers.shape[0]
+    print(f"calc_camera_pose | {n_inliers}/{points_2d.shape[0]} inliers")
+    return corners, view_mat, n_inliers / points_2d.shape[0]
+
+
+def check_distance_between_cameras(view_mat_1: np.array, view_mat_2: np.array, min_distance=0.2) \
+        -> bool:
+    pose_1 = to_camera_center(view_mat_1)
+    pose_2 = to_camera_center(view_mat_2)
+    return np.linalg.norm(pose_1 - pose_2) > min_distance
+
+
+def tricky_range(init_pose: int, end: int, step: int):
+    """ generate  a, a + s, a+2s, ..., a-s, a-2s, ..."""
+    pos = init_pose
+    while 0 <= pos < end:
+        yield pos
+        pos += step
+    pos = init_pose - step
+    while 0 <= pos < end:
+        yield pos
+        pos -= step
+
+    return
+
+
+def find_first_frame(v1, v2, d, n):
+    v1, v2 = min(v1, v2), max(v1, v2)
+    if v2 - v1 >= d:
+        d = 0
+    if np.abs(v2 + d - n) > np.abs(v1 - d):
+        return max(v1 - d, 0), 1
+    else:
+        return min(v2 + d, ((n - 1) // 10) * 10), -1
+
+
+def frame_by_frame_calc(point_cloud_builder: PointCloudBuilder,
+                        corner_storage: CornerStorage, view_mats: np.array,
+                        known_views: list, intrinsic_mat: np.ndarray,
+                        image_shape: Tuple):
+    n_frames = len(corner_storage)
+    frames_list = [frame for frame in corner_storage]
+    calced_frames_ids = []
+    step = 10
+    first_frame, sign = find_first_frame(known_views[0],
+                                         known_views[1], 2 * step, n_frames)
+
+    for frame in tricky_range(first_frame, n_frames, step * sign):
+        print(f"\nFrame = {frame}")
+        calced_frames_ids.append(frame)
+        if frame not in known_views:
+            frames_list[frame], view_mats[frame], _ = \
+                calc_camera_pose(point_cloud_builder, corner_storage[frame],
+                                 intrinsic_mat, image_shape)
+        if frame > 0:
+            prev_frame = frame - step
+            point_cloud_builder = find_and_add_points3d(
+                point_cloud_builder,
+                view_mats[frame],
+                view_mats[prev_frame],
+                intrinsic_mat,
+                frames_list[frame],
+                frames_list[prev_frame]
+            )
+        print(f'{point_cloud_builder.points.shape[0]} 3d points')
+
+    if len(calced_frames_ids) <= 10 and \
+            point_cloud_builder.points.shape[0] <= 1500:
+        frames_list, point_cloud_builder, view_mats = perform_bundle_adjustment(
+            frames_list,
+            point_cloud_builder,
+            view_mats,
+            intrinsic_mat,
+            calced_frames_ids
+        )
+
+    for frame in tricky_range(first_frame, n_frames, sign):  # range(n_frames):
+        print(f"\nFrame = {frame}")
+        if frame not in known_views:
+            frames_list[frame], view_mats[frame], inliers_rate = \
+                calc_camera_pose(point_cloud_builder, frames_list[frame],
+                                 intrinsic_mat, image_shape)
+        for _ in range(10):
+            frame_2 = random.randint(0, n_frames // step - 1) * step
+            if check_distance_between_cameras(view_mats[frame], view_mats[frame_2]):
+                # print(f"{frame} <-> {frame_2} triangulation: ", end='')
+                point_cloud_builder = find_and_add_points3d(
+                    point_cloud_builder,
+                    view_mats[frame],
+                    view_mats[frame_2],
+                    intrinsic_mat,
+                    frames_list[frame],
+                    frames_list[frame_2],
+                    # max_reproj_error=MAX_REPROJ_ERROR
+                )
+        print(f'{point_cloud_builder.points.shape[0]} 3d points')
+
+    print(f"known_views = {known_views}")
+    for frame in known_views:
+        frames_list[frame], view_mats[frame], _ = \
+            calc_camera_pose(point_cloud_builder, corner_storage[frame],
+                             intrinsic_mat, image_shape)
+
+    return frames_list, view_mats
+
+
+def verify_position(correspondence: Correspondences, view_mat: np.ndarray,
+                    intrinsic_mat: np.ndarray,
+                    max_reproj_error: float = MAX_REPROJ_ERROR) \
+        -> Tuple[int, float]:
+    # params = TriangulationParameters(max_reproj_error, 0.1, 0.1)
+    params = TriangulationParameters(2 * MAX_REPROJ_ERROR, 0.1, 0.1)
+    _, ids, _, median_cos = triangulate_correspondences(
+        correspondence,
+        eye3x4(),
+        view_mat,
+        intrinsic_mat,
+        params
+    )
+    return ids.shape[0], median_cos
+
+
+def find_and_check_view_mat(correspondence: Correspondences,
+                            intrinsic_mat: np.ndarray) \
+        -> Tuple[np.ndarray, float, float, float, int, int]:
+    # default parameters everywhere
+    essential_mat, inliers_mask = cv2.findEssentialMat(
+        correspondence.points_1,
+        correspondence.points_2,
+        intrinsic_mat,
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=1.0,
+        maxIters=2000
+    )
+    _, homography_mask = cv2.findHomography(
+        correspondence.points_1,
+        correspondence.points_2,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=MAX_REPROJ_ERROR,
+        maxIters=2000,
+        confidence=0.999
+    )
+    n_essential_inliers = np.sum(inliers_mask)
+    n_homography_inliers = np.sum(homography_mask)
+
+
+    r1, r2, t_abs = cv2.decomposeEssentialMat(essential_mat)
+    max_n_inliers = 0
+    view_mat_best = None
+    m_cos_best = None
+    for r in [r1, r2]:
+        for t in [t_abs, -t_abs]:
+            view_mat = np.hstack((r, t))
+            # view_mat = np.hstack((r, r.T @ -t.reshape(-1, 1)))
+            # print(f"view, r, t shapes = {view_mat.shape}, {r.shape}, {t.shape}")
+            n_inliers, m_cos = verify_position(correspondence, view_mat,
+                                               intrinsic_mat)
+            if n_inliers > max_n_inliers:
+                max_n_inliers = n_inliers
+                view_mat_best = view_mat
+                m_cos_best = m_cos
+
+    homo_inl_rate = n_homography_inliers / max_n_inliers
+    total_inl_rate = max_n_inliers / correspondence.ids.shape[0]
+    # print(correspondence.ids.shape[0])
+    return view_mat_best, homo_inl_rate, total_inl_rate, m_cos_best, n_homography_inliers, n_essential_inliers
 
 
 def get_reproj_threshold(sz):
-    reproj_threshold = 2.0
+    reproj_threshold = 5.0
     if sz > 700:
         reproj_threshold = 4.0
     if sz > 1100:
@@ -104,18 +306,107 @@ def get_step_by_frame(frame_count):
     return step_by_frame
 
 
-def mass_retriangulation(corner_list_storage: CornerStorage,
+def find_and_initialize_frames(corner_storage: CornerStorage,
+                               intrinsic_mat: np.ndarray) \
+        -> Tuple[Tuple[int, Pose], Tuple[int, Pose]]:
+    n_frames = len(corner_storage)
+    errs = []
+    views = []
+
+    frame_step = get_step_by_frame(n_frames)
+
+    for frame_1 in tqdm(range(0, n_frames, frame_step), desc="\nFind_start_position_camers\n"):
+        for frame_2 in range(frame_1 + frame_step, n_frames, frame_step):
+            correspondence = build_correspondences(corner_storage[frame_1],
+                                                   corner_storage[frame_2])
+            # room ok: 30| not ok : 50
+            if correspondence.ids.shape[0] < 30:
+                print(f"FAILED1 | frame1={frame_1} frame2={frame_2}")
+                continue
+
+            view_mat, err, inl_rate, median_cos, n_homography_inliers, n_essential_inliers = find_and_check_view_mat(
+                correspondence, intrinsic_mat
+            )
+
+            if not np.isfinite(err) or view_mat is None:
+                print(f"FAILED2 | frame1={frame_1} frame2={frame_2}")
+                continue
+
+            #if n_essential_inliers < (1/2) * n_homography_inliers:
+            #    print(f"FAILED3 | frame1={frame_1} frame2={frame_2}")
+            #   continue
+
+
+            # bound on angle
+            LOW_BOUND_ON_ANGLE = 2
+            HEIH_BOUND_ON_ANGLE = 10
+            if median_cos > np.cos(LOW_BOUND_ON_ANGLE * (np.pi / 180)):
+                print(f"FAILED4 | frame1={frame_1} frame2={frame_2}")
+                continue
+
+            if median_cos < np.cos(HEIH_BOUND_ON_ANGLE * (np.pi / 180)):
+                print(f"FAILED5 | frame1={frame_1} frame2={frame_2}")
+                continue
+
+            view1 = (frame_1, view_mat3x4_to_pose(eye3x4()))
+            view2 = (frame_2, view_mat3x4_to_pose(view_mat))
+
+            if (err < 0.1 and 1 - median_cos > 0.001) or \
+                    (err < 0.24 and 1 - median_cos > 0.001 and inl_rate >= 0.20):
+                #print("OK")
+                #print(f"FINALLY | frame1={frame_1} frame2={frame_2}")
+                print(f"find_start_position_camers | return | best_frame1={frame_1} best_frame2={frame_2}")
+                return view1, view2
+
+            #print(f"GOOD | frame1={frame_1} frame2={frame_2}")
+            errs.append(err)
+            views.append((view1, view2))
+
+    best_id = np.argmin(np.array(errs))
+    print(f"find_start_position_camers | best_id={best_id}")
+
+    return views[best_id]
+
+
+def add_corner_with_big_id(corner_list_storage: list) -> list:
+    ids = np.array([10000])
+    new_p = np.array([[0, 0]])
+    new_sizes = np.array([10])
+    for i in range(len(corner_list_storage)):
+        corner_list_storage[i].add_points(ids, new_p, new_sizes,
+                                          np.ones((1, 1)), np.zeros((1, 1)))
+
+    return corner_list_storage
+
+
+def verify_all_2d_points(corner_list_storage: list,
                          point_cloud_builder: PointCloudBuilder,
                          view_mats: list, intrinsic_mat: np.ndarray,
-                         max_reproj_error: float,
-                         COUNT_RECALCULATED_PAIR_FRAMES=10) -> PointCloudBuilder:
+                         max_reproj_error: float) -> list:
+    for i in range(len(corner_list_storage)):
+        corner_list_storage[i].all_relevant()
+        _, (idx_3d, idx_2d) = snp.intersect(
+            point_cloud_builder.ids.flatten(),
+            corner_list_storage[i].ids.flatten(), indices=True)
+        inliers = calc_inlier_indices(
+            point_cloud_builder.points[idx_3d],
+            corner_list_storage[i].points[idx_2d],
+            intrinsic_mat @ view_mats[i], max_reproj_error)
+        corner_list_storage[i].relevant[:, 0] = 0
+        corner_list_storage[i].relevant[idx_2d[inliers], 0] = 1
+
+    return corner_list_storage
+
+
+def mass_retriangulation(corner_list_storage: list,
+                         point_cloud_builder: PointCloudBuilder,
+                         view_mats: list, intrinsic_mat: np.ndarray,
+                         max_reproj_error: float) -> PointCloudBuilder:
     max_id = max(corners.ids.max() for corners in corner_list_storage)
     params = TriangulationParameters(max_reproj_error, 0.1, 0.1)
     n_frames = len(corner_list_storage)
 
-    # COUNT_RECALCULATED_PAIR_FRAMES = 10
-
-    for _ in range(COUNT_RECALCULATED_PAIR_FRAMES):
+    for _ in range(10):
         frame_1 = random.randint(0, n_frames - 1)
         frame_2 = random.randint(0, n_frames - 1)
         correspondence = build_correspondences(corner_list_storage[frame_1],
@@ -147,316 +438,83 @@ def mass_retriangulation(corner_list_storage: CornerStorage,
     return point_cloud_builder
 
 
-def frame_by_frame_calc(point_cloud_builder: PointCloudBuilder,
-                        corner_storage: CornerStorage,
-                        view_mats: np.array,
-                        known_views: list,
-                        intrinsic_mat: np.ndarray,
-                        params: TriangulationParameters):
-    print(f"Start frame_by_frame_calc | known_views={known_views} | len(corner_storage)={len(corner_storage)}")
-
-    np.random.seed(42)
-    n_frames = len(corner_storage)
-
-    flag_camera = np.full(shape=n_frames, fill_value=False)
-    for frame in known_views:
-        flag_camera[frame] = True
-
-    def gen_iter_ready_frames(center_frame: int, flag_camera, is_find_ready_frames=True):
-        nonlocal n_frames
-        assert flag_camera[center_frame]
-
-        frame_shift = {1, 2, 3, 4, 5, 10, 20, 30}
-        len_already_frame = np.sum(flag_camera)
-        # for choose not only ready frames but uncalculcaled frames (this we can stage in same function)
-        if not is_find_ready_frames:
-            len_already_frame = len(flag_camera) - len_already_frame
-
-        large_shift = set(list(range(2, len_already_frame, get_step_by_frame(len_already_frame))))
-        frame_shift.union(large_shift)
-
-        cur_less_frame = 0
-        cur_gr_frame = 0
-
-        # find ready frame in left hand
-        for cur_ind_frame in range(center_frame - 1, -1, -1):
-            if not (flag_camera[cur_ind_frame] ^ (not is_find_ready_frames)):
-                continue
-            cur_less_frame += 1
-            if cur_less_frame in frame_shift:
-                yield cur_ind_frame
-        # find ready frame in right hand
-        for cur_ind_frame in range(center_frame + 1, n_frames, 1):
-            if not (flag_camera[cur_ind_frame] ^ (not is_find_ready_frames)):
-                continue
-            cur_gr_frame += 1
-            if cur_gr_frame in frame_shift:
-                yield cur_ind_frame
-
-    confidence = 0.999
-
-    N_COUNT_RETRANGULATION_FRAMES = 4
-    COUNT_READY_FRAMES_FOR_CHOOSE_NEXT_FRAME = 10
-
-    for _ in tqdm(range(2, n_frames), desc="Frame_by_frame_calc"):
-        next_ids_3d, next_points_3d = point_cloud_builder.ids, point_cloud_builder.points
-
-        best_inliers, best_ids, best_next_frame, best_rot_vec, best_t_vec = None, None, None, None, None
-
-        #
-        def choose_iter_for_next_frame(flag_camera):
-            nonlocal COUNT_READY_FRAMES_FOR_CHOOSE_NEXT_FRAME
-            count_ready_frame = np.sum(flag_camera)
-            shift_ready_frames = np.random.randint(low=0,
-                                                   high=count_ready_frame,
-                                                   size=COUNT_READY_FRAMES_FOR_CHOOSE_NEXT_FRAME)
-            cur_shift = 0
-            # print(f"choose_iter_for_next_frame | shift_ready_frames={shift_ready_frames}")
-            for cur_frame in range(len(flag_camera)):
-                if not flag_camera[cur_frame]:
-                    continue
-                if cur_shift in shift_ready_frames:
-                    # print(f"choose_iter_for_next_frame | cur_shift={cur_shift} | cur_frame={cur_frame}")
-
-                    for iter_frame in gen_iter_ready_frames(center_frame=cur_frame, flag_camera=flag_camera,
-                                                            is_find_ready_frames=False):
-                        # print(f"choose_iter_for_next_frame | iter_frame={iter_frame}")
-                        yield iter_frame
-
-                cur_shift += 1
-
-        len_of_set_of_choosed_frames = 0
-        for next_frame in choose_iter_for_next_frame(flag_camera=flag_camera):
-            len_of_set_of_choosed_frames += 1
-            # for next_frame in range(n_frames):
-
-            if flag_camera[next_frame]:
-                continue
-            now_corner = corner_storage[next_frame]
-            now_ids, (now_id_1, now_id_2) = \
-                snp.intersect(now_corner.ids.ravel(),
-                              next_ids_3d.ravel(),
-                              indices=True)
-            if len(now_ids) < 4:
-                continue
-            reprojectionError = get_reproj_threshold(len(now_id_1))
-
-            retval, rot_vec, t_vec, inliers = \
-                cv2.solvePnPRansac(objectPoints=next_points_3d[now_id_2],
-                                   imagePoints=now_corner.points[now_id_1],
-                                   cameraMatrix=intrinsic_mat,
-                                   distCoeffs=None,
-                                   confidence=confidence,
-                                   iterationsCount=3000,
-                                   reprojectionError=reprojectionError
-                                   )
-
-            if not retval:
-                continue
-
-            if best_inliers is None:
-                best_inliers, best_ids, best_next_frame, best_rot_vec, best_t_vec = inliers, now_id_2, next_frame, rot_vec, t_vec
-            elif len(best_inliers) < len(inliers):
-                best_inliers, best_ids, best_next_frame, best_rot_vec, best_t_vec = inliers, now_id_2, next_frame, rot_vec, t_vec
-
-        outliers = np.setdiff1d(np.arange(0, len(next_points_3d[best_ids])), best_inliers.T, assume_unique=True)
-        point_cloud_builder.remove_points(outliers)
-        print(
-            f"Found {len(best_inliers)} inliners for next_frame={best_next_frame}. Remove {len(outliers)} outliers | Find between len_of_set_of_choosed_frames={len_of_set_of_choosed_frames}/{n_frames}")
-
-        view_mats[best_next_frame] = rodrigues_and_translation_to_view_mat3x4(best_rot_vec, best_t_vec)
-        flag_camera[best_next_frame] = True
-
-        add_new_cloud_point_step = 1
-        add_new_cloud_point_cur = -1
-
-        for prepared_frame in gen_iter_ready_frames(best_next_frame, flag_camera):
-            # if not flag_camera[prepared_frame]:
-            #    continue
-            # if prepared_frame == best_next_frame:
-            #    continue
-
-            if not check_distance_between_pair_cameras(view_mats[prepared_frame], view_mats[best_next_frame],
-                                                       min_dist=0.0001):
-                # print(f"DEBUG | MIN DIST prepared_frame={prepared_frame} best_next_frame={best_next_frame}")
-                continue
-            # print(f"DEBUG | BIG DIST prepared_frame={prepared_frame} best_next_frame={best_next_frame}")
-
-            add_new_cloud_point_cur += 1
-            if not (add_new_cloud_point_cur % add_new_cloud_point_step == 0):
-                continue
-
-            point_cloud_builder = find_and_add_points3d(point_cloud_builder,
-                                                        view_mats[prepared_frame],
-                                                        view_mats[best_next_frame],
-                                                        intrinsic_mat,
-                                                        corner_storage[prepared_frame],
-                                                        corner_storage[best_next_frame],
-                                                        params)
-
-        # if _ % 5 == 0:
-        #     # RETRANGULATION
-        #     mass_retriangulation(corner_list_storage=corner_storage,
-        #                          point_cloud_builder=point_cloud_builder,
-        #                          view_mats=view_mats,
-        #                          intrinsic_mat=intrinsic_mat,
-        #                          max_reproj_error=params.max_reprojection_error,
-        #                          COUNT_READY_FRAMES_FOR_CHOOSE_NEXT_FRAME=10)
-
-    return view_mats
-
-
-def find_start_position_camers(corner_storage: CornerStorage,
-                               intrinsic_mat: np.ndarray):
-    params_findEssentialMat = {
-        'method': cv2.RANSAC,
-        'prob': 0.999,
-        # 'prob': 0.8,
-        'threshold': 1,
-        'maxIters': 3000
-        # 'maxIters': 2000
-    }
-    params_findHomography = {
-        "method": cv2.RANSAC,
-        "ransacReprojThreshold": 0.9
-    }
-
-    count_frames = len(corner_storage)
-
-    frame_step = get_step_by_frame(count_frames)
-    # frame_step = 1
-    # if count_frames > 20:
-    #     frame_step = 2
-    # if count_frames > 80:
-    #     frame_step = 3
-    # if count_frames > 140:
-    #     frame_step = 4
-    # if count_frames > 250:
-    #     frame_step = 5
-
-    max_reproj_error = get_reproj_threshold(count_frames)
-
-    min_triangulation_angle_deg = 1
-    min_depth = 0.1
-    triangulation_parameters = TriangulationParameters(max_reproj_error, min_triangulation_angle_deg, min_depth)
-    best_frame1, best_frame2, best_median_cos = None, None, None
-
-    for frame1 in tqdm(range(0, count_frames, frame_step), desc="\nFind_start_position_camers\n"):
-        for frame2 in range(frame1 + frame_step, count_frames, frame_step):
-
-            correspondence = build_correspondences(
-                corner_storage[frame1],
-                corner_storage[frame2]
-            )
-
-            if len(correspondence.ids) < 35:
-                print(f"FAILED1 | frame1={frame1} frame2={frame2}")
-                continue
-
-            essential_matrix, mask_essential = cv2.findEssentialMat(
-                correspondence.points_1,
-                correspondence.points_2,
-                intrinsic_mat,
-                **params_findEssentialMat
-            )
-
-            _, mask_homography = cv2.findHomography(
-                correspondence.points_1,
-                correspondence.points_2,
-                **params_findHomography
-            )
-
-            cnt_mask_essential = np.count_nonzero(mask_essential)
-            cnt_mask_homography = np.count_nonzero(mask_homography)
-            if cnt_mask_essential < 2.3 * cnt_mask_homography:
-                print(f"FAILED2 | frame1={frame1} frame2={frame2}")
-                continue
-
-            _, R, t, _ = cv2.recoverPose(
-                essential_matrix,
-                correspondence.points_1,
-                correspondence.points_2,
-                intrinsic_mat
-            )
-
-            # _calc_triangulation_angle_mask()
-
-            # print()
-            # print(f"R={R}, t={t}")
-
-            # print(f"\nrodrigues_and_translation_to_view_mat3x4(R, t)={rodrigues_and_translation_to_view_mat3x4(R, t)}")
-            _, ids, _, median_cos = triangulate_correspondences(
-                correspondence,
-                eye3x4(),
-                rodrigues_and_translation_to_view_mat3x4(t_vec=t,
-                                                         rot_mat=R),
-                intrinsic_mat,
-                triangulation_parameters
-            )
-
-            if len(ids) < 220:
-                print(f"FAILED3 | frame1={frame1} frame2={frame2}")
-                continue
-
-            # this is double bound very important, it's finding have taked ~5days ()
-            LOW_BOUND_ON_ANGLE = 1.5
-            HEIH_BOUND_ON_ANGLE = 12
-
-            # if a few frames =>  delta by angle so big, and in other case angle need to get so small
-            # if count_frames <= 30:
-            #     HEIH_BOUND_ON_ANGLE = 13
-            #     LOW_BOUND_ON_ANGLE = 2.5
-            # elif count_frames <= 80:
-            #     HEIH_BOUND_ON_ANGLE = 8
-            #     LOW_BOUND_ON_ANGLE = 2
-            # elif count_frames <= 150:
-            #     HEIH_BOUND_ON_ANGLE = 6
-            #     LOW_BOUND_ON_ANGLE = 1.5
-
-            if median_cos > np.cos(LOW_BOUND_ON_ANGLE * (np.pi / 180)):
-                print(f"FAILED4 | frame1={frame1} frame2={frame2}")
-                continue
-
-            if median_cos < np.cos(HEIH_BOUND_ON_ANGLE * (np.pi / 180)):
-                print(f"FAILED5 | frame1={frame1} frame2={frame2}")
-                continue
-
-            # 0 = median_cos a => a = 0 it's bad, 1/2 = median_cos a => a = 30 degree it's good
-            # sort_key = (median_cos,)
-            # print(f"sort_key(median_cos)={sort_key}")
-
-            if best_frame1 is None:
-                best_frame1, best_frame2, best_median_cos = frame1, frame2, median_cos
-            elif best_median_cos > median_cos:
-                best_frame1, best_frame2, best_median_cos = frame1, frame2, median_cos
-
-            # ratio.append((frame1, frame2, sort_key))
-
-    # frame1, frame2, _ = sorted(ratio, key=lambda x: (-x[2][0],))[-1]
-    print(f"find_start_position_camers | best_frame1={best_frame1} best_frame2={best_frame2} best_median_cos={best_median_cos}")
-    correspondence = build_correspondences(
-        corner_storage[best_frame1],
-        corner_storage[best_frame2],
-    )
-
-    essential_matrix, _ = cv2.findEssentialMat(
-        correspondence.points_1,
-        correspondence.points_2,
+def bundle_adjustment(corner_list_storage: list,
+                      point_cloud_builder: PointCloudBuilder,
+                      view_mats: list, intrinsic_mat: np.ndarray,
+                      max_reproj_error: float) \
+        -> Tuple[list, PointCloudBuilder, list]:
+    print("Start bundle adjustment")
+    point_cloud_builder = mass_retriangulation(
+        corner_list_storage,
+        point_cloud_builder,
+        view_mats,
         intrinsic_mat,
-        **params_findEssentialMat
+        max_reproj_error
+    )
+    corner_list_storage = verify_all_2d_points(
+        corner_list_storage,
+        point_cloud_builder,
+        view_mats,
+        intrinsic_mat,
+        max_reproj_error * 2
     )
 
-    _, R, t, _ = cv2.recoverPose(
-        essential_matrix,
-        correspondence.points_1,
-        correspondence.points_2,
-        intrinsic_mat
+    points2d_list = []
+    idx3d_list = []
+    for frame in corner_list_storage:
+        corners = frame.filter_relevant()
+        _, (idx2d, idx3d) = snp.intersect(corners.ids.flatten(),
+                                          point_cloud_builder.ids.flatten(),
+                                          indices=True)
+        points2d_list.append(corners.points[idx2d])
+        idx3d_list.append(idx3d)
+
+    init_vec = views_points_3d_to_vec(view_mats, point_cloud_builder.points)
+    lm_result = least_squares(
+        fun=calc_residuals_all,
+        args=(points2d_list, idx3d_list, intrinsic_mat),
+        x0=init_vec,
+        method='lm',
+        max_nfev=10,
+        verbose=1)
+
+    print("Optimized!")
+    res_vec = lm_result.x
+    view_mats, points3d = vec_to_views_points(res_vec, len(view_mats))
+    idx3d_all = point_cloud_builder.ids
+    new_point_cloud_builder = PointCloudBuilder(idx3d_all, points3d,
+                                                np.zeros(idx3d_all.shape))
+
+    new_corner_list_storage = verify_all_2d_points(
+        corner_list_storage,
+        new_point_cloud_builder,
+        view_mats,
+        intrinsic_mat,
+        max_reproj_error
     )
+    return new_corner_list_storage, new_point_cloud_builder, view_mats
 
-    known_view_1 = (best_frame1, Pose(r_mat=np.eye(3), t_vec=np.zeros(3)))
-    known_view_2 = (best_frame2, Pose(R.T, R.T @ -t))
 
-    return known_view_1, known_view_2
+def perform_bundle_adjustment(corner_list_storage: list,
+                              point_cloud_builder: PointCloudBuilder,
+                              view_mats: list, intrinsic_mat: np.ndarray,
+                              frame_sublist: list) \
+        -> Tuple[list, PointCloudBuilder, list]:
+    print(f"For frames {frame_sublist}")
+    corners_sublist = [corner_list_storage[frame] for frame in frame_sublist]
+    view_mats_sublist = [view_mats[frame] for frame in frame_sublist]
+    new_corner_sub, new_pc_builder, new_view_sub = bundle_adjustment(
+        corners_sublist,
+        point_cloud_builder,
+        view_mats_sublist,
+        intrinsic_mat,
+        max_reproj_error=MAX_REPROJ_ERROR
+    )
+    for i, frame in enumerate(frame_sublist):
+        corner_list_storage[frame] = new_corner_sub[i]
+        view_mats[frame] = new_view_sub[i]
+
+    return corner_list_storage, new_pc_builder, view_mats
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -465,61 +523,64 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
+    random.seed(42)
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
         camera_parameters,
         rgb_sequence[0].shape[0]
     )
 
-    if known_view_1 is None or known_view_1 is None:
+    if known_view_1 is None or known_view_2 is None:
         print("There are not start's views. Start finding two first position:")
-        known_view_1, known_view_2 = find_start_position_camers(corner_storage, intrinsic_mat)
+        known_view_1, known_view_2 = find_and_initialize_frames(corner_storage,
+                                                                intrinsic_mat)
         print(f"known_view is None | known_view_1 = {known_view_1}, \n known_view_2={known_view_2}")
     else:
         print("There are start's views")
         print(f"known_view is None | known_view_1 = {known_view_1}, \n known_view_2={known_view_2}")
 
-    # ('max_reprojection_error', 'min_triangulation_angle_deg', 'min_depth')
-    params = TriangulationParameters(1, 0.9, 0.4)
 
     # TODO: implement
+    image_shape = (rgb_sequence[0].shape[1], rgb_sequence[0].shape[0])
     frame_count = len(corner_storage)
     view_mats = [pose_to_view_mat3x4(known_view_1[1])] * frame_count
     view_mats[known_view_2[0]] = pose_to_view_mat3x4(known_view_2[1])
-
-    point_cloud_builder = PointCloudBuilder()
-    # corners_0 = corner_storage[0]
-    # point_cloud_builder = PointCloudBuilder(corners_0.ids[:1],
-    #                                         np.zeros((1, 3)))
-
     print(f"track_and_calc_colors | frame_count={frame_count} | ")
-    known_id1, known_id2 = known_view_1[0], known_view_2[0]
     print("Start track_and_calc_colors | first find_and_add_points3d")
-    point_cloud_builder = find_and_add_points3d(point_cloud_builder,
-                                                pose_to_view_mat3x4(known_view_1[1]),
-                                                pose_to_view_mat3x4(known_view_2[1]),
-                                                intrinsic_mat,
-                                                corner_storage[known_id1],
-                                                corner_storage[known_id2],
-                                                params
-                                                )
 
-    # view_mats[best_id] = calc_camera_pose(point_cloud_builder, corner_storage[best_id], intrinsic_mat)
+    known_id1, known_id2 = known_view_1[0], known_view_2[0]
+    point_cloud_builder = PointCloudBuilder()
+    point_cloud_builder = find_and_add_points3d(
+        point_cloud_builder,
+        pose_to_view_mat3x4(known_view_1[1]),
+        pose_to_view_mat3x4(known_view_2[1]),
+        intrinsic_mat,
+        corner_storage[known_id1],
+        corner_storage[known_id2]
+    )
 
-    view_mats = frame_by_frame_calc(point_cloud_builder,
-                                    corner_storage,
-                                    view_mats,
-                                    [known_id1, known_id2],
-                                    intrinsic_mat,
-                                    params)
+    frames_list, view_mats = frame_by_frame_calc(
+        point_cloud_builder,
+        corner_storage,
+        view_mats,
+        [known_id1, known_id2],
+        intrinsic_mat,
+        image_shape
+    )
 
-    #
+    frames_list = verify_all_2d_points(frames_list, point_cloud_builder,
+                                       view_mats, intrinsic_mat, MAX_REPROJ_ERROR)
+
+    relevant_corners = [frame.filter_relevant() for frame in frames_list]
+    relevant_corners = add_corner_with_big_id(relevant_corners)
+    new_corner_storage = StorageImpl(relevant_corners)
+
     calc_point_cloud_colors(
         point_cloud_builder,
         rgb_sequence,
         view_mats,
         intrinsic_mat,
-        corner_storage,
+        new_corner_storage,
         5.0
     )
     point_cloud = point_cloud_builder.build_point_cloud()
