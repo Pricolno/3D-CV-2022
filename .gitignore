@@ -1,4 +1,9 @@
 # Byte-compiled / optimized / DLL files
+
+camtrack/help.py
+camtrack/test_results
+camtrack/dataset
+
 __pycache__/
 *.py[cod]
 *$py.class
